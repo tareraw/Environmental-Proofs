@@ -1,0 +1,393 @@
+# importing all modules
+import os
+import re
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+from scipy import stats
+import rasterio
+from rasterio.transform import from_origin
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better visualizations
+plt.style.use('default')
+sns.set_palette("husl")
+
+# ---------------- USER INPUTS ----------------
+input_dir = r"C:\Users\tc\Documents\projects\environmental lapse rate\temperature (C)"
+output_dir = r"C:\Users\tc\Documents\projects\environmental lapse rate\lapse rate"
+temp_var = "t"  # Temperature variable name in NetCDF files
+R = 287.05  # J/(kg*K) - gas constant for dry air
+g = 9.81   # m/s² - gravity
+# ---------------------------------------------
+
+os.makedirs(output_dir, exist_ok=True)
+
+def pressure_to_height(p, T_mean=260):
+    """Convert pressure (Pa) to height (m) using hypsometric equation."""
+    p0 = 100000  # reference pressure 1000 hPa
+    return -(R * T_mean / g) * np.log(p / p0)
+
+def detect_temperature_units(ds, var_name):
+    """Try to detect temperature units from dataset attributes."""
+    # Check units attribute first
+    if hasattr(ds[var_name], 'units'):
+        units = ds[var_name].units.lower()
+        if 'celsius' in units or 'c' in units:
+            return 'celsius'
+        elif 'kelvin' in units or 'k' in units:
+            return 'kelvin'
+    
+    # If no units attribute, check variable name
+    var_lower = var_name.lower()
+    if 'celsius' in var_lower or 'c' in var_lower:
+        return 'celsius'
+    elif 'kelvin' in var_lower or 'k' in var_lower:
+        return 'kelvin'
+    
+    # Default assumption based on directory name
+    if "celsius" in input_dir.lower() or "c" in input_dir.lower():
+        return 'celsius'
+    elif "kelvin" in input_dir.lower() or "k" in input_dir.lower():
+        return 'kelvin'
+    
+    # Final fallback - assume Celsius as user indicated
+    return 'celsius'
+
+# Collect all nc files
+nc_files = [f for f in os.listdir(input_dir) if f.endswith(".nc")]
+nc_files.sort()  # Sort for consistent ordering
+
+# Dictionary to store all temperature data by pressure level
+pressure_data = {}
+
+# We'll use the first file to get the spatial dimensions
+first_file = os.path.join(input_dir, nc_files[0])
+ds_example = xr.open_dataset(first_file)
+
+# Find lat/lon dims
+lat_dims = [d for d in ds_example.dims if "lat" in d.lower() or "y" in d.lower()]
+lon_dims = [d for d in ds_example.dims if "lon" in d.lower() or "x" in d.lower()]
+
+if not lat_dims or not lon_dims:
+    print("Could not find latitude/longitude dimensions in the data")
+    exit()
+
+lat_name, lon_name = lat_dims[0], lon_dims[0]
+lats = ds_example[lat_name].values
+lons = ds_example[lon_name].values
+
+# Check for additional dimensions (like time, level, etc.)
+other_dims = [d for d in ds_example.dims if d not in [lat_name, lon_name]]
+print(f"Other dimensions found: {other_dims}")
+
+ds_example.close()
+
+print(f"Spatial dimensions: {len(lats)} latitudes, {len(lons)} longitudes")
+
+# Initialize arrays for storing data at each pressure level
+for file in nc_files:
+    in_path = os.path.join(input_dir, file)
+    try:
+        ds = xr.open_dataset(in_path)
+
+        if temp_var not in ds.variables:
+            print(f"Skipping {file} (no variable '{temp_var}')")
+            ds.close()
+            continue
+
+        T = ds[temp_var]
+        
+        # Detect temperature units
+        units = detect_temperature_units(ds, temp_var)
+        print(f"Processing {file} - Detected units: {units}")
+
+        # Find time dimension and select first time step if needed
+        time_dims = [d for d in T.dims if "time" in d.lower()]
+        if time_dims:
+            T_slice = T.isel({time_dims[0]: 0})
+        else:
+            T_slice = T
+
+        # Handle other non-spatial dimensions by selecting first element
+        for dim in T_slice.dims:
+            if dim not in [lat_name, lon_name] and T_slice.sizes[dim] > 1:
+                T_slice = T_slice.isel({dim: 0})
+                print(f"   Selected first element for dimension: {dim}")
+
+        # Extract the 2D temperature field
+        T_data = T_slice.values
+        
+        # Check if we have a 2D array
+        if T_data.ndim != 2:
+            print(f"Unexpected array dimensions: {T_data.shape}. Trying to reshape...")
+            # Try to get the last two dimensions as lat/lon
+            if T_data.ndim > 2:
+                T_data = T_data.reshape(-1, T_data.shape[-2], T_data.shape[-1])[0]
+        
+        # Convert to Celsius if needed
+        if units == 'kelvin':
+            T_data = T_data - 273.15
+            print("   Converted from Kelvin to Celsius")
+        
+        # Extract pressure level
+        if "level" in ds.coords:
+            p = float(ds["level"].values)
+        elif "isobaricInhPa" in ds.coords:
+            p = float(ds["isobaricInhPa"].values)
+        elif "pressure_level" in ds.coords:
+            p = float(ds["pressure_level"].values)
+        else:
+            # Try to parse from filename
+            match = re.search(r"(\d+)", file)
+            if match:
+                p = float(match.group(1))
+            else:
+                print(f"ould not find pressure level for {file}")
+                ds.close()
+                continue
+
+        # Convert to Pa if in hPa (assuming pressure < 2000 is hPa)
+        if p < 2000:
+            p = p * 100
+        
+        # Store the pressure level data
+        pressure_data[p] = T_data
+        
+        ds.close()
+        
+    except Exception as e:
+        print(f"Error processing {file}: {str(e)}")
+        continue
+
+# Sort pressure levels from highest to lowest pressure (surface to upper atmosphere)
+pressure_levels = sorted(pressure_data.keys(), reverse=True)
+print(f"Pressure levels found: {[p/100 for p in pressure_levels]} hPa")
+
+if len(pressure_levels) < 2:
+    print("Need at least 2 pressure levels to calculate lapse rate")
+    exit()
+
+# Calculate approximate heights for each pressure level
+# Use mean temperature for hypsometric equation
+mean_temps = [np.nanmean(pressure_data[p]) for p in pressure_levels]
+mean_temp_kelvin = np.nanmean(mean_temps) + 273.15
+heights = [pressure_to_height(p, T_mean=mean_temp_kelvin) for p in pressure_levels]
+heights_km = [h / 1000 for h in heights]  # Convert to km
+
+print(f"Approximate heights: {[f'{h:.1f}' for h in heights_km]} km")
+
+# Initialize array for ELR at each grid point
+elr_grid = np.full((len(lats), len(lons)), np.nan)
+
+# Calculate ELR at each grid point
+for i in range(len(lats)):
+    for j in range(len(lons)):
+        # Extract temperature profile at this grid point
+        temp_profile = []
+        valid_data = True
+        
+        for p in pressure_levels:
+            # Extract the value at this grid point
+            try:
+                temp_val = pressure_data[p][i, j]
+                # Ensure we have a scalar value
+                if hasattr(temp_val, '__len__') and not isinstance(temp_val, str):
+                    if len(temp_val) == 1:
+                        temp_val = temp_val[0]
+                    else:
+                        print(f"Multiple values at grid point ({i}, {j}) for pressure {p}")
+                        valid_data = False
+                        break
+                
+                # Check if the value is NaN
+                if np.isnan(temp_val):
+                    valid_data = False
+                    break
+                    
+                temp_profile.append(float(temp_val))
+            except (IndexError, TypeError) as e:
+                print(f"Error accessing data at ({i}, {j}) for pressure {p}: {e}")
+                valid_data = False
+                break
+        
+        # Only calculate ELR if we have valid data at all levels
+        if valid_data and len(temp_profile) > 1:
+            try:
+                # Perform linear regression (temperature vs height)
+                slope, intercept, r_value, p_value, std_err = stats.linregress(heights_km, temp_profile)
+                elr_grid[i, j] = slope
+            except Exception:
+                # If regression fails, skip this point
+                continue
+
+print(f"ELR calculation complete. Range: {np.nanmin(elr_grid):.2f} to {np.nanmax(elr_grid):.2f} °C/km")
+
+# Create output datasets
+# 1. NetCDF file
+output_nc = os.path.join(output_dir, "elr_grid.nc")
+
+# Create xarray Dataset
+ds_out = xr.Dataset(
+    {
+        "elr": (["lat", "lon"], elr_grid)
+    },
+    coords={
+        "lat": lats,
+        "lon": lons
+    },
+    attrs={
+        "title": "Environmental Lapse Rate",
+        "units": "°C/km",
+        "description": "Environmental Lapse Rate calculated from temperature profiles",
+        "pressure_levels": str([p/100 for p in pressure_levels]),
+        "heights_km": str([f"{h:.2f}" for h in heights_km])
+    }
+)
+
+# Save to NetCDF
+ds_out.to_netcdf(output_nc)
+print(f"Saved NetCDF file: {output_nc}")
+
+# 2. GeoTIFF file
+# For GeoTIFF, we need to determine the spatial resolution and extent
+if len(lats) > 1 and len(lons) > 1:
+    lat_res = abs(lats[1] - lats[0])
+    lon_res = abs(lons[1] - lons[0])
+    
+    transform = from_origin(
+        np.min(lons) - lon_res/2,  # West
+        np.max(lats) + lat_res/2,  # North
+        lon_res, lat_res
+    )
+    
+    output_tif = os.path.join(output_dir, "elr_grid.tif")
+    
+    with rasterio.open(
+        output_tif,
+        'w',
+        driver='GTiff',
+        height=len(lats),
+        width=len(lons),
+        count=1,
+        dtype=str(elr_grid.dtype),
+        crs='EPSG:4326',  # WGS84
+        transform=transform,
+        nodata=np.nan
+    ) as dst:
+        # Flip the array if latitudes are in descending order
+        if lats[0] > lats[-1]:
+            dst.write(np.flipud(elr_grid), 1)
+        else:
+            dst.write(elr_grid, 1)
+    
+    print(f"Saved GeoTIFF file: {output_tif}")
+
+# 3. Create a map visualization
+print("Creating ELR map...")
+
+# Create the plot
+fig = plt.figure(figsize=(12, 10))
+ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+
+# Add map features
+ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+ax.add_feature(cfeature.STATES, linewidth=0.5)
+ax.add_feature(cfeature.LAND, color='lightgray', alpha=0.5)
+ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.5)
+
+# Plot the ELR data
+im = ax.pcolormesh(lons, lats, elr_grid, cmap='RdBu_r', 
+                   vmin=-10, vmax=0, transform=ccrs.PlateCarree())
+
+# Add colorbar
+cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.1, shrink=0.8)
+cbar.set_label('Environmental Lapse Rate (°C/km)', fontsize=12)
+
+# Add gridlines
+gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                  linewidth=0.5, color='gray', alpha=0.5, linestyle='--')
+gl.top_labels = False
+gl.right_labels = False
+gl.xformatter = LONGITUDE_FORMATTER
+gl.yformatter = LATITUDE_FORMATTER
+gl.xlabel_style = {'size': 10}
+gl.ylabel_style = {'size': 10}
+
+# Set title
+ax.set_title('Environmental Lapse Rate (ELR)', fontsize=16, fontweight='bold')
+
+# Set extent to focus on the data region
+ax.set_extent([np.min(lons), np.max(lons), np.min(lats), np.max(lats)], crs=ccrs.PlateCarree())
+
+# Save the map
+output_map = os.path.join(output_dir, "elr_map.png")
+plt.savefig(output_map, dpi=300, bbox_inches='tight')
+plt.close()
+
+print(f"Saved ELR map: {output_map}")
+
+# 4. Create a summary report
+report_text = f"""
+ENVIRONMENTAL LAPSE RATE (ELR) SPATIAL ANALYSIS
+===============================================
+
+Data Source: {input_dir}
+Processed Files: {len(nc_files)}
+Pressure Levels: {len(pressure_levels)}
+Spatial Dimensions: {len(lats)} latitudes × {len(lons)} longitudes
+
+PRESSURE LEVELS AND APPROXIMATE HEIGHTS:
+"""
+for i, (p, h) in enumerate(zip(pressure_levels, heights_km)):
+    report_text += f"- Level {i+1}: {p/100:.1f} hPa ≈ {h:.2f} km\n"
+
+report_text += f"""
+ELR STATISTICS:
+- Minimum: {np.nanmin(elr_grid):.2f} °C/km
+- Maximum: {np.nanmax(elr_grid):.2f} °C/km
+- Mean: {np.nanmean(elr_grid):.2f} °C/km
+- Standard Deviation: {np.nanstd(elr_grid):.2f} °C/km
+
+INTERPRETATION FOR HAIL FORMATION:
+"""
+
+# Calculate percentage of area with unstable conditions
+valid_pixels = np.sum(~np.isnan(elr_grid))
+if valid_pixels > 0:
+    unstable_area = np.sum(elr_grid < -6.5) / valid_pixels * 100
+    very_unstable_area = np.sum(elr_grid < -9.0) / valid_pixels * 100
+else:
+    unstable_area = 0
+    very_unstable_area = 0
+
+report_text += f"""
+- Area with unstable conditions (ELR < -6.5°C/km): {unstable_area:.1f}%
+- Area with very unstable conditions (ELR < -9.0°C/km): {very_unstable_area:.1f}%
+
+For hail formation in Zimbabwe, look for:
+1. Regions with ELR < -6.5°C/km (unstable atmosphere)
+2. Regions with ELR < -9.0°C/km (very unstable, high hail potential)
+3. Spatial patterns showing organized areas of instability
+
+OUTPUT FILES:
+- NetCDF: {output_nc}
+- GeoTIFF: {output_tif if len(lats) > 1 and len(lons) > 1 else "Not created (insufficient spatial resolution)"}
+- Map: {output_map}
+"""
+
+report_path = os.path.join(output_dir, "elr_spatial_analysis_report.txt")
+with open(report_path, 'w') as f:
+    f.write(report_text)
+
+print(f"Saved analysis report: {report_path}")
+print("\n" + "="*60)
+print("SPATIAL ELR ANALYSIS COMPLETE")
+print("="*60)
+print(report_text)
